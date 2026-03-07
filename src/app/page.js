@@ -152,12 +152,85 @@ export default function DesignTool() {
   const [hoveredId, setHoveredId] = useState(null);
   const canvasRef = useRef(null);
 
+  // ── Undo / Redo ──
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  const artboardsRef = useRef(artboards);
+  const elementsRef = useRef(elements);
+  artboardsRef.current = artboards;
+  elementsRef.current = elements;
+
+  const historyRef = useRef({ past: [], future: [] });
+  const propChangeSnapRef = useRef(null);
+  const propChangeTimerRef = useRef(null);
+  const dragSnapRef = useRef(null);
+
+  const getSnapshot = useCallback(() => ({
+    artboards: JSON.parse(JSON.stringify(artboardsRef.current)),
+    elements: JSON.parse(JSON.stringify(elementsRef.current)),
+  }), []);
+
+  const pushToHistory = useCallback((snap) => {
+    const h = historyRef.current;
+    h.past = [...h.past.slice(-49), snap];
+    h.future = [];
+    setCanUndo(true);
+    setCanRedo(false);
+  }, []);
+
+  // Debounced: captures state before first change in a burst, pushes after 500ms quiet
+  const recordChange = useCallback(() => {
+    if (!propChangeSnapRef.current) {
+      propChangeSnapRef.current = getSnapshot();
+    }
+    clearTimeout(propChangeTimerRef.current);
+    propChangeTimerRef.current = setTimeout(() => {
+      if (propChangeSnapRef.current) {
+        pushToHistory(propChangeSnapRef.current);
+        propChangeSnapRef.current = null;
+      }
+    }, 500);
+  }, [getSnapshot, pushToHistory]);
+
+  const undo = useCallback(() => {
+    clearTimeout(propChangeTimerRef.current);
+    propChangeSnapRef.current = null;
+    const h = historyRef.current;
+    if (!h.past.length) return;
+    const current = getSnapshot();
+    const prev = h.past[h.past.length - 1];
+    h.past = h.past.slice(0, -1);
+    h.future = [current, ...h.future.slice(0, 49)];
+    setArtboards(prev.artboards);
+    setElements(prev.elements);
+    setSelectedIds(new Set());
+    setCanUndo(h.past.length > 0);
+    setCanRedo(true);
+  }, [getSnapshot]);
+
+  const redo = useCallback(() => {
+    clearTimeout(propChangeTimerRef.current);
+    propChangeSnapRef.current = null;
+    const h = historyRef.current;
+    if (!h.future.length) return;
+    const current = getSnapshot();
+    const next = h.future[0];
+    h.future = h.future.slice(1);
+    h.past = [...h.past.slice(-49), current];
+    setArtboards(next.artboards);
+    setElements(next.elements);
+    setSelectedIds(new Set());
+    setCanUndo(true);
+    setCanRedo(h.future.length > 0);
+  }, [getSnapshot]);
+
   // ── Artboard CRUD ──
   const updateArtboard = useCallback((id, patch) => {
     setArtboards(prev => prev.map(ab => ab.id === id ? { ...ab, ...patch } : ab));
   }, []);
 
   const addArtboard = useCallback(() => {
+    pushToHistory(getSnapshot());
     setArtboards(prev => {
       const lastAb = prev[prev.length - 1];
       const newAb = {
@@ -172,9 +245,10 @@ export default function DesignTool() {
       return [...prev, newAb];
     });
     setSelectedIds(new Set());
-  }, []);
+  }, [getSnapshot, pushToHistory]);
 
   const deleteArtboard = useCallback((id) => {
+    pushToHistory(getSnapshot());
     setArtboards(prev => {
       if (prev.length <= 1) return prev;
       const remaining = prev.filter(ab => ab.id !== id);
@@ -201,7 +275,7 @@ export default function DesignTool() {
       return remaining;
     });
     setSelectedIds(new Set());
-  }, []);
+  }, [getSnapshot, pushToHistory]);
 
   // ── Element CRUD ──
   const updateEl = useCallback((id, patch) => {
@@ -209,6 +283,7 @@ export default function DesignTool() {
   }, []);
 
   const addElement = useCallback((factory, parentId = null) => {
+    pushToHistory(getSnapshot());
     const el = factory(parentId);
     setElements(prev => ({ ...prev, [el.id]: el }));
     if (parentId) {
@@ -224,10 +299,11 @@ export default function DesignTool() {
       ));
     }
     setSelectedIds(new Set([el.id]));
-  }, [activeArtboardId]);
+  }, [activeArtboardId, getSnapshot, pushToHistory]);
 
   const deleteElement = useCallback((id) => {
     if (!id) return;
+    pushToHistory(getSnapshot());
     const el = elements[id];
     if (el.parent) {
       setElements(prev => ({
@@ -252,10 +328,11 @@ export default function DesignTool() {
       return next;
     });
     setSelectedIds(prev => { const n = new Set(prev); n.delete(id); return n; });
-  }, [elements]);
+  }, [elements, getSnapshot, pushToHistory]);
 
   const duplicateElement = useCallback((id) => {
     if (!id) return;
+    pushToHistory(getSnapshot());
     const el = elements[id];
     const newId = uid();
     const cloned = { ...el, id: newId, label: el.label + " copy", children: [] };
@@ -272,11 +349,12 @@ export default function DesignTool() {
       })));
     }
     setSelectedIds(new Set([newId]));
-  }, [elements]);
+  }, [elements, getSnapshot, pushToHistory]);
 
   // ── Batch delete / duplicate for multi-select ──
   const deleteSelected = useCallback(() => {
     if (selectedIds.size === 0) return;
+    pushToHistory(getSnapshot());
     const ids = [...selectedIds];
     const toRemove = new Set();
     const gather = (eid) => {
@@ -299,10 +377,11 @@ export default function DesignTool() {
     setArtboards(prev => prev.map(ab => ({ ...ab, children: ab.children.filter(c => !toRemove.has(c)) })));
     setElements(prev => { const next = { ...prev }; toRemove.forEach(r => delete next[r]); return next; });
     setSelectedIds(new Set());
-  }, [elements, selectedIds]);
+  }, [elements, selectedIds, getSnapshot, pushToHistory]);
 
   const duplicateSelected = useCallback(() => {
     if (selectedIds.size === 0) return;
+    pushToHistory(getSnapshot());
     const newIds = [];
     [...selectedIds].forEach(id => {
       const el = elements[id];
@@ -324,13 +403,14 @@ export default function DesignTool() {
       newIds.push(newId);
     });
     setSelectedIds(new Set(newIds));
-  }, [elements, selectedIds]);
+  }, [elements, selectedIds, getSnapshot, pushToHistory]);
 
   // ── Drag (absolute positioned elements) ──
   const onMouseDown = useCallback((e, id) => {
     e.stopPropagation();
     const el = elements[id];
     if (el.position === "absolute") {
+      dragSnapRef.current = getSnapshot();
       setDragging({ id, startX: e.clientX, startY: e.clientY, origX: el.x || 0, origY: el.y || 0 });
     }
     if (e.shiftKey || e.metaKey || e.ctrlKey) {
@@ -351,15 +431,16 @@ export default function DesignTool() {
     } else {
       setSelectedIds(new Set([id]));
     }
-  }, [elements, artboards]);
+  }, [elements, artboards, getSnapshot]);
 
   // ── Resize ──
   const onResizeStart = useCallback((e, id, handle) => {
     e.stopPropagation();
     e.preventDefault();
+    dragSnapRef.current = getSnapshot();
     const el = elements[id];
     setResizing({ id, handle, startX: e.clientX, startY: e.clientY, origW: typeof el.width === "number" ? el.width : 120, origH: typeof el.height === "number" ? el.height : 80, origX: el.x || 0, origY: el.y || 0 });
-  }, [elements]);
+  }, [elements, getSnapshot]);
 
   useEffect(() => {
     const onMove = (e) => {
@@ -391,15 +472,23 @@ export default function DesignTool() {
         setPanStart({ x: e.clientX, y: e.clientY });
       }
     };
-    const onUp = () => { setDragging(null); setResizing(null); setDraggingArtboard(null); setIsPanning(false); setPanStart(null); };
+    const onUp = () => {
+      if ((dragging || resizing || draggingArtboard) && dragSnapRef.current) {
+        pushToHistory(dragSnapRef.current);
+        dragSnapRef.current = null;
+      }
+      setDragging(null); setResizing(null); setDraggingArtboard(null); setIsPanning(false); setPanStart(null);
+    };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
-  }, [dragging, resizing, draggingArtboard, isPanning, panStart, zoom, updateEl, updateArtboard]);
+  }, [dragging, resizing, draggingArtboard, isPanning, panStart, zoom, updateEl, updateArtboard, pushToHistory]);
 
   // ── Keyboard shortcuts ──
   useEffect(() => {
     const onKey = (e) => {
+      if ((e.key === "z" || e.key === "Z") && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+      if (e.key === "y" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); redo(); return; }
       if (editingText) return;
       if ((e.key === "Delete" || e.key === "Backspace") && selectedIds.size > 0) { e.preventDefault(); deleteSelected(); }
       if (e.key === "d" && (e.metaKey || e.ctrlKey) && selectedIds.size > 0) { e.preventDefault(); duplicateSelected(); }
@@ -407,7 +496,7 @@ export default function DesignTool() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedIds, editingText, deleteSelected, duplicateSelected]);
+  }, [selectedIds, editingText, deleteSelected, duplicateSelected, undo, redo]);
 
   // Canvas pan with middle mouse / space
   const onCanvasMouseDown = (e) => {
@@ -477,6 +566,7 @@ export default function DesignTool() {
             if (dragId && dragId !== id) {
               const dragEl = elements[dragId];
               if (dragEl) {
+                pushToHistory(getSnapshot());
                 if (dragEl.parent) {
                   setElements(prev => ({
                     ...prev,
@@ -656,6 +746,10 @@ export default function DesignTool() {
   const activeArtboard = artboards.find(ab => ab.id === activeArtboardId);
 
   const renderProps = () => {
+    // Helpers that record change for undo/redo
+    const update = (id, patch) => { recordChange(); updateEl(id, patch); };
+    const updateAb = (id, patch) => { recordChange(); updateArtboard(id, patch); };
+
     // Multi-select panel
     if (selectedIds.size > 1) {
       const selectedEls = [...selectedIds].map(id => elements[id]).filter(Boolean);
@@ -664,7 +758,7 @@ export default function DesignTool() {
         return vals.every(v => v === vals[0]) ? vals[0] : undefined;
       };
       const mixed = (key) => selectedEls.map(e => e[key]).some((v, _, a) => v !== a[0]);
-      const updateAll = (patch) => [...selectedIds].forEach(id => updateEl(id, patch));
+      const updateAll = (patch) => { recordChange(); [...selectedIds].forEach(id => updateEl(id, patch)); };
       const allType = selectedEls.every(e => e.type === selectedEls[0]?.type) ? selectedEls[0]?.type : null;
       return (
         <div style={{ overflowY: "auto", flex: 1 }}>
@@ -741,12 +835,12 @@ export default function DesignTool() {
           <Section title="Artboard" defaultOpen>
             <input
               value={activeArtboard.name}
-              onChange={e => updateArtboard(activeArtboard.id, { name: e.target.value })}
+              onChange={e => updateAb(activeArtboard.id,{ name: e.target.value })}
               style={{ width: "100%", background: "#1e1e2e", border: "1px solid #3a3a4a", borderRadius: 4, color: "#e0e0e0", padding: "5px 8px", fontSize: 12, outline: "none", marginBottom: 8 }}
             />
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-              <NumInput label="Width" value={activeArtboard.width} onChange={v => updateArtboard(activeArtboard.id, { width: v })} min={100} />
-              <NumInput label="Height" value={activeArtboard.height} onChange={v => updateArtboard(activeArtboard.id, { height: v })} min={100} />
+              <NumInput label="Width" value={activeArtboard.width} onChange={v => updateAb(activeArtboard.id,{ width: v })} min={100} />
+              <NumInput label="Height" value={activeArtboard.height} onChange={v => updateAb(activeArtboard.id,{ height: v })} min={100} />
             </div>
             {artboards.length > 1 && (
               <button
@@ -765,19 +859,19 @@ export default function DesignTool() {
       <div style={{ overflowY: "auto", flex: 1 }}>
         {/* Label */}
         <Section title="Element" defaultOpen>
-          <input value={sel.label} onChange={e => updateEl(sel.id, { label: e.target.value })}
+          <input value={sel.label} onChange={e => update(sel.id,{ label: e.target.value })}
             style={{ width: "100%", background: "#1e1e2e", border: "1px solid #3a3a4a", borderRadius: 4, color: "#e0e0e0", padding: "5px 8px", fontSize: 12, outline: "none", marginBottom: 6 }} />
           <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
-            <BtnGroup label="Position" value={sel.position} onChange={v => updateEl(sel.id, { position: v })} options={["relative", "absolute"]} />
+            <BtnGroup label="Position" value={sel.position} onChange={v => update(sel.id,{ position: v })} options={["relative", "absolute"]} />
           </div>
           {sel.position === "absolute" && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-              <NumInput label="X" value={sel.x} onChange={v => updateEl(sel.id, { x: v })} />
-              <NumInput label="Y" value={sel.y} onChange={v => updateEl(sel.id, { y: v })} />
+              <NumInput label="X" value={sel.x} onChange={v => update(sel.id,{ x: v })} />
+              <NumInput label="Y" value={sel.y} onChange={v => update(sel.id,{ y: v })} />
             </div>
           )}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 6 }}>
-            <NumInput label="Opacity" value={sel.opacity ?? 1} onChange={v => updateEl(sel.id, { opacity: v })} min={0} max={1} step={0.05} />
+            <NumInput label="Opacity" value={sel.opacity ?? 1} onChange={v => update(sel.id,{ opacity: v })} min={0} max={1} step={0.05} />
           </div>
         </Section>
 
@@ -788,46 +882,53 @@ export default function DesignTool() {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <BtnGroup label="Width" value={sel.width === "100%" ? "fill" : "fixed"}
-                    onChange={v => updateEl(sel.id, { width: v === "fill" ? "100%" : (typeof sel.width === "number" ? sel.width : 120) })}
+                    onChange={v => update(sel.id,{ width: v === "fill" ? "100%" : (typeof sel.width === "number" ? sel.width : 120) })}
                     options={[{ value: "fixed", label: "Fixed" }, { value: "fill", label: "Fill" }]} />
                   {sel.width !== "100%" && (
-                    <NumInput value={typeof sel.width === "number" ? sel.width : 120} onChange={v => updateEl(sel.id, { width: v })} min={10} />
+                    <NumInput value={typeof sel.width === "number" ? sel.width : 120} onChange={v => update(sel.id,{ width: v })} min={10} />
                   )}
                 </div>
-                <NumInput label="Height" value={sel.height} onChange={v => updateEl(sel.id, { height: v })} min={10} />
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <BtnGroup label="Height" value={sel.height === "100%" ? "fill" : "fixed"}
+                    onChange={v => update(sel.id,{ height: v === "fill" ? "100%" : (typeof sel.height === "number" ? sel.height : 80) })}
+                    options={[{ value: "fixed", label: "Fixed" }, { value: "fill", label: "Fill" }]} />
+                  {sel.height !== "100%" && (
+                    <NumInput value={typeof sel.height === "number" ? sel.height : 80} onChange={v => update(sel.id,{ height: v })} min={10} />
+                  )}
+                </div>
               </div>
             </Section>
 
             <Section title="Fill & Border">
               <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8 }}>
-                <ColorInput value={sel.bg} onChange={v => updateEl(sel.id, { bg: v })} label="Fill" />
-                <ColorInput value={sel.borderColor || "#000"} onChange={v => updateEl(sel.id, { borderColor: v })} label="Border" />
+                <ColorInput value={sel.bg} onChange={v => update(sel.id,{ bg: v })} label="Fill" />
+                <ColorInput value={sel.borderColor || "#000"} onChange={v => update(sel.id,{ borderColor: v })} label="Border" />
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                <NumInput label="Radius" value={sel.borderRadius} onChange={v => updateEl(sel.id, { borderRadius: v })} min={0} />
-                <NumInput label="Border W" value={sel.borderWidth || 0} onChange={v => updateEl(sel.id, { borderWidth: v })} min={0} />
+                <NumInput label="Radius" value={sel.borderRadius} onChange={v => update(sel.id,{ borderRadius: v })} min={0} />
+                <NumInput label="Border W" value={sel.borderWidth || 0} onChange={v => update(sel.id,{ borderWidth: v })} min={0} />
               </div>
             </Section>
 
             <Section title="Flexbox Container">
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                <BtnGroup label="Direction" value={sel.flexDirection} onChange={v => updateEl(sel.id, { flexDirection: v })}
+                <BtnGroup label="Direction" value={sel.flexDirection} onChange={v => update(sel.id,{ flexDirection: v })}
                   options={[{ value: "row", label: "→" }, { value: "column", label: "↓" }, { value: "row-reverse", label: "←" }, { value: "column-reverse", label: "↑" }]} />
-                <BtnGroup label="Wrap" value={sel.flexWrap} onChange={v => updateEl(sel.id, { flexWrap: v })}
+                <BtnGroup label="Wrap" value={sel.flexWrap} onChange={v => update(sel.id,{ flexWrap: v })}
                   options={["nowrap", "wrap"]} />
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 6 }}>
-                <SelectInput label="Justify" value={sel.justifyContent} onChange={v => updateEl(sel.id, { justifyContent: v })}
+                <SelectInput label="Justify" value={sel.justifyContent} onChange={v => update(sel.id,{ justifyContent: v })}
                   options={["flex-start", "center", "flex-end", "space-between", "space-around", "space-evenly"]} />
-                <SelectInput label="Align" value={sel.alignItems} onChange={v => updateEl(sel.id, { alignItems: v })}
+                <SelectInput label="Align" value={sel.alignItems} onChange={v => update(sel.id,{ alignItems: v })}
                   options={["flex-start", "center", "flex-end", "stretch", "baseline"]} />
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 6 }}>
-                <NumInput label="Gap" value={sel.gap} onChange={v => updateEl(sel.id, { gap: v })} min={0} />
-                <NumInput label="Padding" value={sel.padding} onChange={v => updateEl(sel.id, { padding: v })} min={0} />
+                <NumInput label="Gap" value={sel.gap} onChange={v => update(sel.id,{ gap: v })} min={0} />
+                <NumInput label="Padding" value={sel.padding} onChange={v => update(sel.id,{ padding: v })} min={0} />
               </div>
               <div style={{ marginTop: 6 }}>
-                <SelectInput label="Overflow" value={sel.overflow || "visible"} onChange={v => updateEl(sel.id, { overflow: v })}
+                <SelectInput label="Overflow" value={sel.overflow || "visible"} onChange={v => update(sel.id,{ overflow: v })}
                   options={["visible", "hidden", "scroll", "auto"]} />
               </div>
             </Section>
@@ -839,30 +940,30 @@ export default function DesignTool() {
           <>
           <Section title="Size">
             <BtnGroup label="Width" value={sel.width === "100%" ? "fill" : "auto"}
-              onChange={v => updateEl(sel.id, { width: v === "fill" ? "100%" : "auto" })}
+              onChange={v => update(sel.id,{ width: v === "fill" ? "100%" : "auto" })}
               options={[{ value: "auto", label: "Auto" }, { value: "fill", label: "Fill" }]} />
           </Section>
           <Section title="Typography">
-            <textarea value={sel.content} onChange={e => updateEl(sel.id, { content: e.target.value })} rows={3}
+            <textarea value={sel.content} onChange={e => update(sel.id,{ content: e.target.value })} rows={3}
               style={{ width: "100%", background: "#1e1e2e", border: "1px solid #3a3a4a", borderRadius: 4, color: "#e0e0e0", padding: "5px 8px", fontSize: 12, resize: "vertical", outline: "none", marginBottom: 6, fontFamily: "inherit" }} />
             <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-              <ColorInput value={sel.color} onChange={v => updateEl(sel.id, { color: v })} label="Color" />
+              <ColorInput value={sel.color} onChange={v => update(sel.id,{ color: v })} label="Color" />
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-              <NumInput label="Size" value={sel.fontSize} onChange={v => updateEl(sel.id, { fontSize: v })} min={6} max={200} />
-              <SelectInput label="Weight" value={sel.fontWeight} onChange={v => updateEl(sel.id, { fontWeight: v })}
+              <NumInput label="Size" value={sel.fontSize} onChange={v => update(sel.id,{ fontSize: v })} min={6} max={200} />
+              <SelectInput label="Weight" value={sel.fontWeight} onChange={v => update(sel.id,{ fontWeight: v })}
                 options={["100", "200", "300", "400", "500", "600", "700", "800", "900"]} />
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 6 }}>
-              <SelectInput label="Align" value={sel.textAlign} onChange={v => updateEl(sel.id, { textAlign: v })}
+              <SelectInput label="Align" value={sel.textAlign} onChange={v => update(sel.id,{ textAlign: v })}
                 options={["left", "center", "right"]} />
-              <NumInput label="Line H" value={sel.lineHeight} onChange={v => updateEl(sel.id, { lineHeight: v })} min={0.5} max={4} step={0.1} />
+              <NumInput label="Line H" value={sel.lineHeight} onChange={v => update(sel.id,{ lineHeight: v })} min={0.5} max={4} step={0.1} />
             </div>
             <div style={{ marginTop: 6 }}>
-              <NumInput label="Letter Spacing" value={sel.letterSpacing} onChange={v => updateEl(sel.id, { letterSpacing: v })} min={-5} max={20} step={0.5} />
+              <NumInput label="Letter Spacing" value={sel.letterSpacing} onChange={v => update(sel.id,{ letterSpacing: v })} min={-5} max={20} step={0.5} />
             </div>
             <div style={{ marginTop: 6 }}>
-              <SelectInput label="Font" value={sel.fontFamily} onChange={v => updateEl(sel.id, { fontFamily: v })}
+              <SelectInput label="Font" value={sel.fontFamily} onChange={v => update(sel.id,{ fontFamily: v })}
                 options={[
                   { value: "'Inter', sans-serif", label: "Inter" },
                   { value: "'Georgia', serif", label: "Georgia" },
@@ -883,7 +984,7 @@ export default function DesignTool() {
           <Section title="Icon">
             <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 4, marginBottom: 8 }}>
               {ICON_NAMES.map(name => (
-                <button key={name} onClick={() => updateEl(sel.id, { iconName: name })}
+                <button key={name} onClick={() => update(sel.id,{ iconName: name })}
                   style={{
                     padding: 6, background: sel.iconName === name ? "#6366f1" : "#1e1e2e",
                     border: sel.iconName === name ? "1px solid #818cf8" : "1px solid #3a3a4a",
@@ -895,20 +996,20 @@ export default function DesignTool() {
               ))}
             </div>
             <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
-              <ColorInput value={sel.color} onChange={v => updateEl(sel.id, { color: v })} label="Color" />
+              <ColorInput value={sel.color} onChange={v => update(sel.id,{ color: v })} label="Color" />
             </div>
-            <NumInput label="Size" value={sel.iconSize} onChange={v => updateEl(sel.id, { iconSize: v })} min={8} max={128} />
+            <NumInput label="Size" value={sel.iconSize} onChange={v => update(sel.id,{ iconSize: v })} min={8} max={128} />
           </Section>
         )}
 
         {/* Flex child properties (for all) */}
         <Section title="Flex Child" defaultOpen={false}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-            <NumInput label="Grow" value={sel.flexGrow ?? 0} onChange={v => updateEl(sel.id, { flexGrow: v })} min={0} max={10} />
-            <NumInput label="Shrink" value={sel.flexShrink ?? 1} onChange={v => updateEl(sel.id, { flexShrink: v })} min={0} max={10} />
+            <NumInput label="Grow" value={sel.flexGrow ?? 0} onChange={v => update(sel.id,{ flexGrow: v })} min={0} max={10} />
+            <NumInput label="Shrink" value={sel.flexShrink ?? 1} onChange={v => update(sel.id,{ flexShrink: v })} min={0} max={10} />
           </div>
           <div style={{ marginTop: 6 }}>
-            <SelectInput label="Align Self" value={sel.alignSelf || "auto"} onChange={v => updateEl(sel.id, { alignSelf: v })}
+            <SelectInput label="Align Self" value={sel.alignSelf || "auto"} onChange={v => update(sel.id,{ alignSelf: v })}
               options={["auto", "flex-start", "center", "flex-end", "stretch", "baseline"]} />
           </div>
         </Section>
@@ -982,6 +1083,14 @@ export default function DesignTool() {
           {renderTree()}
         </div>
 
+        {/* Undo / Redo */}
+        <div style={{ padding: "6px 10px", borderTop: "1px solid #2a2a3a", display: "flex", alignItems: "center", gap: 4 }}>
+          <button onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"
+            style={{ ...zoomBtnStyle, flex: 1, opacity: canUndo ? 1 : 0.35, fontSize: 14 }}>↩</button>
+          <button onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Y)"
+            style={{ ...zoomBtnStyle, flex: 1, opacity: canRedo ? 1 : 0.35, fontSize: 14 }}>↪</button>
+        </div>
+
         {/* Zoom */}
         <div style={{ padding: "8px 10px", borderTop: "1px solid #2a2a3a", display: "flex", alignItems: "center", gap: 6 }}>
           <button onClick={() => setZoom(z => Math.max(0.1, z - 0.1))} style={zoomBtnStyle}>−</button>
@@ -1016,6 +1125,7 @@ export default function DesignTool() {
                     e.stopPropagation();
                     setActiveArtboardId(ab.id);
                     setSelectedIds(new Set());
+                    dragSnapRef.current = getSnapshot();
                     setDraggingArtboard({ id: ab.id, startX: e.clientX, startY: e.clientY, origX: ab.x, origY: ab.y });
                   }}
                   style={{
@@ -1052,6 +1162,7 @@ export default function DesignTool() {
                     if (dragId && elements[dragId]) {
                       const dragEl = elements[dragId];
                       if (dragEl.parent) {
+                        pushToHistory(getSnapshot());
                         setElements(prev => ({
                           ...prev,
                           [dragEl.parent]: { ...prev[dragEl.parent], children: prev[dragEl.parent].children.filter(c => c !== dragId) }
@@ -1079,6 +1190,7 @@ export default function DesignTool() {
           <span><b style={{ color: "#888" }}>Dbl-click</b> text to edit</span>
           <span><b style={{ color: "#888" }}>Del</b> remove</span>
           <span><b style={{ color: "#888" }}>Ctrl+D</b> duplicate</span>
+          <span><b style={{ color: "#888" }}>Ctrl+Z</b> undo</span>
         </div>
       </div>
 
